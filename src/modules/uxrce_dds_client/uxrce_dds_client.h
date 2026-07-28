@@ -131,6 +131,9 @@ private:
 	void checkConnectivity(uxrSession *session);
 	void resetConnectivityCounters();
 
+	/** @return true if the transport has data waiting to be read */
+	bool transportHasPendingData();
+
 	uORB::Publication<message_format_response_s> _message_format_response_pub{ORB_ID(message_format_response)};
 	uORB::Subscription _message_format_request_sub{ORB_ID(message_format_request)};
 

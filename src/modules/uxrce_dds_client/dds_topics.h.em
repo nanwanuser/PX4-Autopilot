@@ -30,7 +30,7 @@ import os
 #include <uORB/topics/@(include).h>
 @[end for]@
 
-#define UXRCE_DEFAULT_POLL_INTERVAL_MS 10
+#define UXRCE_DEFAULT_POLL_INTERVAL_MS 1
 
 typedef bool (*UcdrSerializeMethod)(const void* data, ucdrBuffer& buf, int64_t time_offset);
 

@@ -46,6 +46,7 @@
 
 #include <termios.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdlib.h>
 #include <unistd.h>
 
@@ -53,7 +54,51 @@ static constexpr char NAMESPACE_PREFIX[] = "uav_";
 #define PARTICIPANT_XML_SIZE 512
 static constexpr uint8_t TIMESYNC_MAX_TIMEOUTS = 10;
 
+// Upper bound on datagrams drained from the transport per iteration of the main loop.
+// Inbound traffic is only ever consumed by this task, so it must be able to drain faster
+// than the peer produces. Bounded so that a flooding peer cannot starve the outbound path.
+static constexpr int MAX_RX_DRAIN_PER_ITERATION = 20;
+
 using namespace time_literals;
+
+/*
+ * The UDP read-ahead queue and the UDP write buffers are allocated from the same, shared NuttX
+ * I/O buffer pool (CONFIG_IOB_NBUFFERS, 24 on the ethernet boards). Unless buffers are reserved
+ * for the transmit path via CONFIG_IOB_THROTTLE, inbound traffic can consume every last one.
+ *
+ * That creates a deadlock cycle under a high inbound publish rate:
+ *   1. Read-ahead queues datagrams until the IOB pool is exhausted. The queue is unbounded by
+ *      default, because CONFIG_NET_RECV_BUFSIZE defaults to 0.
+ *   2. This task then calls send(). On a blocking socket that lands in
+ *      udp_wrbuffer_timedalloc(UINT_MAX) -> net_ioballoc(), which waits indefinitely for a
+ *      buffer to be returned to the pool.
+ *   3. The only consumer of that read-ahead queue is this very task, which is now blocked in
+ *      send(). No buffer is ever freed, so the wait never ends.
+ *
+ * Making the transport socket non-blocking breaks the cycle at step 2: send() fails with EAGAIN
+ * instead of waiting, the loop returns to reading, and the queued datagrams get consumed. Losing
+ * an outbound best-effort sample is always preferable to stalling the task that has to drain the
+ * receive queue. The ethernet board configs additionally set CONFIG_IOB_THROTTLE so that inbound
+ * traffic cannot drain the pool in the first place, which keeps the rest of the network stack
+ * (other sockets, ICMP) working even when this task is starved of CPU.
+ */
+#if defined(UXRCE_DDS_CLIENT_UDP)
+static void configure_socket_non_blocking(int fd)
+{
+	if (fd < 0) {
+		return;
+	}
+
+	const int flags = fcntl(fd, F_GETFL, 0);
+
+	if (flags < 0) {
+		PX4_ERR("F_GETFL failed (%i), transport may block under load", errno);
+
+	} else if ((flags & O_NONBLOCK) == 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+		PX4_ERR("F_SETFL O_NONBLOCK failed (%i), transport may block under load", errno);
+	}
+}
+#endif // UXRCE_DDS_CLIENT_UDP
 
 static void on_time(uxrSession *session, int64_t current_time, int64_t client_transmit_timestamp,
 		    int64_t agent_receive_timestamp, int64_t originate_timestamp, void *args)
@@ -162,6 +207,8 @@ bool UxrceddsClient::init()
 			_comm = &_transport_udp->comm;
 			_fd = _transport_udp->platform.poll_fd.fd;
 
+			configure_socket_non_blocking(_fd);
+
 			return true;
 
 		} else {
@@ -176,11 +223,9 @@ bool UxrceddsClient::init()
 
 void UxrceddsClient::deinit()
 {
-	if (_fd >= 0) {
-		close(_fd);
-		_fd = -1;
-	}
-
+	// Do not close _fd here: it is owned by the transport, and uxr_close_*_transport() below
+	// closes it. Closing it twice can tear down an unrelated descriptor that happens to reuse
+	// the number in between.
 	if (_transport_serial) {
 		uxr_close_serial_transport(_transport_serial);
 		delete _transport_serial;
@@ -198,6 +243,7 @@ void UxrceddsClient::deinit()
 #endif // UXRCE_DDS_CLIENT_UDP
 
 	_comm = nullptr;
+	_fd = -1;
 }
 
 bool UxrceddsClient::setupSession(uxrSession *session)
@@ -557,6 +603,25 @@ void UxrceddsClient::checkConnectivity(uxrSession *session)
 	}
 }
 
+bool UxrceddsClient::transportHasPendingData()
+{
+	if (_fd < 0) {
+		return false;
+	}
+
+	// poll() rather than ioctl(FIONREAD): FIONREAD reports only the size of the first queued
+	// datagram on a UDP socket, and is not implemented at all for every character device that can
+	// back the serial transport. A zero-timeout poll() answers the actual question on both.
+	//
+	// Note this is the libc poll(), not px4_poll(): on POSIX builds px4_poll() only resolves uORB
+	// cdev handles and would fail on a socket descriptor.
+	struct pollfd pollfd {};
+	pollfd.fd = _fd;
+	pollfd.events = POLLIN;
+
+	return ::poll(&pollfd, 1, 0) > 0;
+}
+
 void UxrceddsClient::resetConnectivityCounters()
 {
 	_last_status_update = hrt_absolute_time();
@@ -647,12 +712,10 @@ void UxrceddsClient::run()
 
 			int orb_poll_timeout_ms = 10;
 
-			int bytes_available = 0;
-
-			if (ioctl(_fd, FIONREAD, (unsigned long)&bytes_available) == OK) {
-				if (bytes_available > 10) {
-					orb_poll_timeout_ms = 0;
-				}
+			// Don't wait on uORB while the transport still holds unread data: the receive queue
+			// shares its buffer pool with the transmit path, so it has to be drained promptly.
+			if (transportHasPendingData()) {
+				orb_poll_timeout_ms = 0;
 			}
 
 			/* Wait for topic updates for max 10 ms */
@@ -674,8 +737,15 @@ void UxrceddsClient::run()
 				}
 			}
 
-			// run session with 0 timeout (non-blocking)
-			uxr_run_session_timeout(&session, 0);
+			// Run the session with 0 timeout (non-blocking). Each call consumes at most one
+			// datagram, so a single call per iteration drains slower than a fast publisher fills
+			// the receive queue, and the backlog grows without bound. Keep draining while data is
+			// pending, but cap the burst so a flooding peer cannot monopolise the loop.
+			int drained = 0;
+
+			do {
+				uxr_run_session_timeout(&session, 0);
+			} while (++drained < MAX_RX_DRAIN_PER_ITERATION && transportHasPendingData());
 
 			// check if there are available replies
 			process_replies();
