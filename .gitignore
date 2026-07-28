@@ -109,3 +109,12 @@ src/systemcmds/topic_listener/listener_generated.cpp
 # colcon
 log/
 keys/
+
+# 本地实验代码，不属于本 fork 的固件构建
+# 这些目录内含嵌套 git 仓库，直接 add 会产生无 URL 的幻影子模块，
+# 导致他人克隆后目录为空
+/src/lib/rl_tools/
+/src/modules/mc_raptor/
+/src/modules/uxrce_dds_client/Micro-XRCE-DDS-Client-v3/
+/src/modules/simulation/gz_plugins/optical_flow/PX4-OpticalFlow/
+/boards/modalai/voxl2/src/lib/
